@@ -1,0 +1,17 @@
+{
+  "name": "@chat-agent/queue",
+  "version": "0.1.0",
+  "description": "Queue API and file-backed store for chat-agent applications",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3"
+  }
+}
