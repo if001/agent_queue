@@ -1,5 +1,6 @@
 export type QueueTaskType = "user" | "scheduled_recurring" | "scheduled_once";
 export type QueueTaskAction = "mention" | "agent_input";
+export type QueueTaskSource = "user" | "simple_pomdp" | "scheduled";
 
 interface BaseQueueTask {
   id: string;
@@ -8,6 +9,8 @@ interface BaseQueueTask {
   text: string;
   channelId: string;
   targetThreadId: string;
+  source: QueueTaskSource;
+  sourceInteractionId?: string;
   dueAt: string;
   intervalMinutes?: number;
   createdAt: string;
@@ -73,6 +76,8 @@ export interface QueueApi extends QueueStore, QueueStatusProvider {
     userId: string;
     channelId: string;
     text: string;
+    source?: Exclude<QueueTaskSource, "user">;
+    sourceInteractionId?: string;
     dueAt?: Date;
     intervalMinutes?: number;
   }): Promise<AgentInputQueueTask>;
