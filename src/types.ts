@@ -10,6 +10,7 @@ interface BaseQueueTask {
   channelId: string;
   userId: string;
   targetThreadId: string;
+  conversationVersion: number;
   source: QueueTaskSource;
   sourceInteractionId?: string;
   dueAt: string;
@@ -39,6 +40,7 @@ export interface QueueStatusItem {
   dueAt: string;
   locked: boolean;
   targetThreadId: string;
+  conversationVersion: number;
   textPreview: string;
 }
 
@@ -57,6 +59,7 @@ export interface QueueStore {
   dequeueReady(now: Date): Promise<QueueTask | null>;
   ack(taskId: string): Promise<void>;
   release(taskId: string, nextDueAt?: Date): Promise<void>;
+  getLatestConversationVersion(threadId: string): Promise<number>;
 }
 
 export interface QueueStatusProvider {

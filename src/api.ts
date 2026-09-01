@@ -3,7 +3,13 @@ import { AgentInputQueueTask, MentionQueueTask, QueueApi } from "./types";
 
 type QueueBackend = Pick<
   FileQueueStore,
-  "enqueueTask" | "dequeueReady" | "ack" | "release" | "getStatus"
+  | "enqueueMentionTask"
+  | "enqueueTask"
+  | "dequeueReady"
+  | "ack"
+  | "release"
+  | "getStatus"
+  | "getLatestConversationVersion"
 >;
 
 export const buildConversationThreadId = (
@@ -31,7 +37,7 @@ export const parseConversationThreadId = (
 
 export const createQueueApi = (store: QueueBackend): QueueApi => ({
   enqueueMention: async (input): Promise<MentionQueueTask> =>
-    store.enqueueTask({
+    store.enqueueMentionTask({
       type: "user",
       action: "mention",
       text: input.text,
@@ -43,40 +49,94 @@ export const createQueueApi = (store: QueueBackend): QueueApi => ({
       source: "user",
       dueAt: (input.dueAt ?? new Date()).toISOString(),
     }) as Promise<MentionQueueTask>,
-  enqueueConversationInput: async (input): Promise<AgentInputQueueTask> =>
-    store.enqueueTask({
+  enqueueConversationInput: async (input): Promise<AgentInputQueueTask> => {
+    const targetThreadId = buildConversationThreadId(
+      input.channelId,
+      input.userId,
+    );
+    return store.enqueueTask({
       type: input.intervalMinutes ? "scheduled_recurring" : "scheduled_once",
       action: "agent_input",
       text: input.text,
       channelId: input.channelId,
       userId: input.userId,
-      targetThreadId: buildConversationThreadId(input.channelId, input.userId),
+      targetThreadId,
+      conversationVersion:
+        await store.getLatestConversationVersion(targetThreadId),
       source: input.source ?? "scheduled",
       sourceInteractionId: input.sourceInteractionId,
       dueAt: (input.dueAt ?? new Date()).toISOString(),
       ...(input.intervalMinutes ? { intervalMinutes: input.intervalMinutes } : {}),
-    }) as Promise<AgentInputQueueTask>,
-  enqueueScheduledInput: async (input): Promise<AgentInputQueueTask> =>
-    store.enqueueTask({
+    }) as Promise<AgentInputQueueTask>;
+  },
+  enqueueScheduledInput: async (input): Promise<AgentInputQueueTask> => {
+    const targetThreadId = buildConversationThreadId(
+      input.channelId,
+      input.userId,
+    );
+    return store.enqueueTask({
       type: input.intervalMinutes ? "scheduled_recurring" : "scheduled_once",
       action: "agent_input",
       text: input.text,
       channelId: input.channelId,
       userId: input.userId,
-      targetThreadId: buildConversationThreadId(input.channelId, input.userId),
+      targetThreadId,
+      conversationVersion:
+        await store.getLatestConversationVersion(targetThreadId),
       source: "scheduled",
       dueAt: (input.dueAt ?? new Date()).toISOString(),
       ...(input.intervalMinutes ? { intervalMinutes: input.intervalMinutes } : {}),
-    }) as Promise<AgentInputQueueTask>,
+    }) as Promise<AgentInputQueueTask>;
+  },
   dequeueReady: (now) => store.dequeueReady(now),
   ack: (taskId) => store.ack(taskId),
   release: (taskId, nextDueAt) => store.release(taskId, nextDueAt),
   getStatus: (now, limit) => store.getStatus(now, limit),
+  getLatestConversationVersion: (threadId) =>
+    store.getLatestConversationVersion(threadId),
 });
 
 export const createInMemoryQueueApi = (): QueueApi => {
   const items: Array<MentionQueueTask | AgentInputQueueTask> = [];
+  const conversationVersions = new Map<string, number>();
   return createQueueApi({
+    enqueueMentionTask: async (input) => {
+      const nextVersion =
+        (conversationVersions.get(input.targetThreadId) ?? 0) + 1;
+      conversationVersions.set(input.targetThreadId, nextVersion);
+      const pending = items.find(
+        (item): item is MentionQueueTask =>
+          item.action === "mention" &&
+          item.targetThreadId === input.targetThreadId &&
+          !item.locked,
+      );
+      const processing = items.find(
+        (item): item is MentionQueueTask =>
+          item.action === "mention" &&
+          item.targetThreadId === input.targetThreadId &&
+          item.locked,
+      );
+      if (pending) {
+        pending.text = mergeUserInput(pending.text, input.text);
+        pending.mentionsBot = pending.mentionsBot || input.mentionsBot;
+        pending.conversationVersion = nextVersion;
+        pending.dueAt = input.dueAt;
+        return pending;
+      }
+      const task = {
+        id: `inline_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+        ...input,
+        mentionsBot: processing?.mentionsBot || input.mentionsBot,
+        text: processing
+          ? mergeUserInput(processing.text, input.text)
+          : input.text,
+        conversationVersion: nextVersion,
+        createdAt: new Date().toISOString(),
+        locked: false,
+      } as MentionQueueTask;
+      items.push(task);
+      return task;
+    },
     enqueueTask: async (input) => {
       const task = {
         id: `inline_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
@@ -104,7 +164,23 @@ export const createInMemoryQueueApi = (): QueueApi => {
     ack: async (id) => {
       const idx = items.findIndex((it) => it.id === id);
       if (idx >= 0) {
-        items.splice(idx, 1);
+        const current = items[idx];
+        if (
+          current?.type === "scheduled_recurring" &&
+          current.intervalMinutes
+        ) {
+          items[idx] = {
+            ...current,
+            conversationVersion:
+              conversationVersions.get(current.targetThreadId) ?? 0,
+            dueAt: new Date(
+              Date.now() + current.intervalMinutes * 60 * 1000,
+            ).toISOString(),
+            locked: false,
+          };
+        } else {
+          items.splice(idx, 1);
+        }
       }
     },
     release: async (id) => {
@@ -155,9 +231,15 @@ export const createInMemoryQueueApi = (): QueueApi => {
             dueAt: item.dueAt,
             locked: item.locked,
             targetThreadId: item.targetThreadId,
+            conversationVersion: item.conversationVersion,
             textPreview: item.text,
           })),
       };
     },
+    getLatestConversationVersion: async (threadId) =>
+      conversationVersions.get(threadId) ?? 0,
   });
 };
+
+const mergeUserInput = (previous: string, next: string): string =>
+  `${previous}\n\nAdditional user message:\n${next}`;
