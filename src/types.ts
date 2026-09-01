@@ -8,6 +8,7 @@ interface BaseQueueTask {
   action: QueueTaskAction;
   text: string;
   channelId: string;
+  userId: string;
   targetThreadId: string;
   source: QueueTaskSource;
   sourceInteractionId?: string;
@@ -83,6 +84,7 @@ export interface QueueApi extends QueueStore, QueueStatusProvider {
   }): Promise<AgentInputQueueTask>;
   enqueueScheduledInput(input: {
     botId: string;
+    userId: string;
     channelId: string;
     text: string;
     dueAt?: Date;

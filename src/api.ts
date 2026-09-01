@@ -1,7 +1,10 @@
 import { FileQueueStore } from "./fileQueueStore";
 import { AgentInputQueueTask, MentionQueueTask, QueueApi } from "./types";
 
-interface QueueBackend extends Pick<FileQueueStore, "enqueueTask" | "dequeueReady" | "ack" | "release" | "getStatus"> {}
+type QueueBackend = Pick<
+  FileQueueStore,
+  "enqueueTask" | "dequeueReady" | "ack" | "release" | "getStatus"
+>;
 
 export const buildConversationThreadId = (
   channelId: string,
@@ -33,6 +36,7 @@ export const createQueueApi = (store: QueueBackend): QueueApi => ({
       action: "mention",
       text: input.text,
       channelId: input.channelId,
+      userId: input.userId,
       authorId: input.userId,
       mentionsBot: input.mentionsBot,
       targetThreadId: buildConversationThreadId(input.channelId, input.userId),
@@ -45,6 +49,7 @@ export const createQueueApi = (store: QueueBackend): QueueApi => ({
       action: "agent_input",
       text: input.text,
       channelId: input.channelId,
+      userId: input.userId,
       targetThreadId: buildConversationThreadId(input.channelId, input.userId),
       source: input.source ?? "scheduled",
       sourceInteractionId: input.sourceInteractionId,
@@ -57,7 +62,8 @@ export const createQueueApi = (store: QueueBackend): QueueApi => ({
       action: "agent_input",
       text: input.text,
       channelId: input.channelId,
-      targetThreadId: buildScheduledThreadId(input.channelId),
+      userId: input.userId,
+      targetThreadId: buildConversationThreadId(input.channelId, input.userId),
       source: "scheduled",
       dueAt: (input.dueAt ?? new Date()).toISOString(),
       ...(input.intervalMinutes ? { intervalMinutes: input.intervalMinutes } : {}),
