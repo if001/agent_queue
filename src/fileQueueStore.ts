@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { AgentInputQueueTask, MentionQueueTask, QueueStatus, QueueTask } from "./types";
 
@@ -72,6 +72,15 @@ export class FileQueueStore {
 
   private async enqueueTaskUnlocked(input: PersistedQueueTaskInput): Promise<QueueTask> {
     const state = await this.readState();
+    if (input.sourceInteractionId) {
+      const duplicate = state.tasks.find(
+        (task) =>
+          task.sourceInteractionId === input.sourceInteractionId &&
+          task.targetThreadId === input.targetThreadId &&
+          !task.failedAt,
+      );
+      if (duplicate) return duplicate;
+    }
     const task: QueueTask = {
       id: buildTaskId(),
       ...input,
@@ -90,8 +99,15 @@ export class FileQueueStore {
   private async dequeueReadyUnlocked(now: Date): Promise<QueueTask | null> {
     const state = await this.readState();
     const items = state.tasks;
+    const staleLockBefore = now.getTime() - 5 * 60 * 1000;
+    for (const item of items) {
+      if (item.locked && (!item.lockedAt || Date.parse(item.lockedAt) <= staleLockBefore)) {
+        item.locked = false;
+        delete item.lockedAt;
+      }
+    }
     const candidates = items
-      .filter((item) => !item.locked && new Date(item.dueAt).getTime() <= now.getTime())
+      .filter((item) => !item.locked && !item.failedAt && new Date(item.dueAt).getTime() <= now.getTime())
       .sort(comparePriority);
     const next = candidates[0];
     if (!next) {
@@ -105,7 +121,7 @@ export class FileQueueStore {
     if (!current) {
       return null;
     }
-    items[idx] = { ...current, locked: true };
+    items[idx] = { ...current, locked: true, lockedAt: now.toISOString() };
     await this.writeState(state);
     return items[idx] ?? null;
   }
@@ -133,6 +149,7 @@ export class FileQueueStore {
           state.conversationVersions[target.targetThreadId] ?? 0,
         dueAt: nextDueAt,
         locked: false,
+        lockedAt: undefined,
       };
     } else {
       items.splice(index, 1);
@@ -140,11 +157,11 @@ export class FileQueueStore {
     await this.writeState(state);
   }
 
-  release(taskId: string, nextDueAt?: Date): Promise<void> {
-    return this.mutate(() => this.releaseUnlocked(taskId, nextDueAt));
+  release(taskId: string, nextDueAt?: Date, error?: string): Promise<void> {
+    return this.mutate(() => this.releaseUnlocked(taskId, nextDueAt, error));
   }
 
-  private async releaseUnlocked(taskId: string, nextDueAt?: Date): Promise<void> {
+  private async releaseUnlocked(taskId: string, nextDueAt?: Date, error?: string): Promise<void> {
     const state = await this.readState();
     const items = state.tasks;
     const index = items.findIndex((item) => item.id === taskId);
@@ -155,10 +172,15 @@ export class FileQueueStore {
     if (!target) {
       return;
     }
+    const attempts = (target.attempts ?? 0) + (error ? 1 : 0);
     items[index] = {
       ...target,
+      attempts,
+      ...(error ? { lastError: error } : {}),
+      ...(attempts >= 3 ? { failedAt: new Date().toISOString() } : {}),
       dueAt: (nextDueAt ?? new Date(Date.now() + 30_000)).toISOString(),
       locked: false,
+      lockedAt: undefined,
     };
     await this.writeState(state);
   }
@@ -189,7 +211,7 @@ export class FileQueueStore {
     }
 
     const next = items
-      .filter((item) => !item.locked)
+      .filter((item) => !item.locked && !item.failedAt)
       .sort(comparePriority)
       .slice(0, Math.max(0, limit))
       .map((item) => ({
@@ -240,16 +262,44 @@ export class FileQueueStore {
 
   private async writeState(state: QueueState): Promise<void> {
     await mkdir(dirname(this.filePath), { recursive: true });
-    await writeFile(this.filePath, JSON.stringify(state, null, 2), "utf8");
+    const temporaryPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(temporaryPath, JSON.stringify(state, null, 2), "utf8");
+    await rename(temporaryPath, this.filePath);
   }
 
   private mutate<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.mutationQueue.then(operation, operation);
+    const lockedOperation = () => this.withFileLock(operation);
+    const result = this.mutationQueue.then(lockedOperation, lockedOperation);
     this.mutationQueue = result.then(
       () => undefined,
       () => undefined,
     );
     return result;
+  }
+
+  private async withFileLock<T>(operation: () => Promise<T>): Promise<T> {
+    const lockPath = `${this.filePath}.lock`;
+    await mkdir(dirname(this.filePath), { recursive: true });
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        const handle = await open(lockPath, "wx");
+        try {
+          return await operation();
+        } finally {
+          await handle.close();
+          await unlink(lockPath).catch(() => undefined);
+        }
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const lockStat = await stat(lockPath).catch(() => null);
+        if (lockStat && Date.now() - lockStat.mtimeMs > 30_000) {
+          await unlink(lockPath).catch(() => undefined);
+          continue;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    throw new Error(`queue lock timeout: ${lockPath}`);
   }
 }
 

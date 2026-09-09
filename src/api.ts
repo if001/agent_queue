@@ -90,7 +90,7 @@ export const createQueueApi = (store: QueueBackend): QueueApi => ({
   },
   dequeueReady: (now) => store.dequeueReady(now),
   ack: (taskId) => store.ack(taskId),
-  release: (taskId, nextDueAt) => store.release(taskId, nextDueAt),
+  release: (taskId, nextDueAt, error) => store.release(taskId, nextDueAt, error),
   getStatus: (now, limit) => store.getStatus(now, limit),
   getLatestConversationVersion: (threadId) =>
     store.getLatestConversationVersion(threadId),
@@ -149,7 +149,10 @@ export const createInMemoryQueueApi = (): QueueApi => {
     },
     dequeueReady: async (now) => {
       const idx = items.findIndex(
-        (it) => !it.locked && new Date(it.dueAt).getTime() <= now.getTime(),
+        (it) =>
+          !it.locked &&
+          !it.failedAt &&
+          new Date(it.dueAt).getTime() <= now.getTime(),
       );
       if (idx < 0) {
         return null;
@@ -183,12 +186,26 @@ export const createInMemoryQueueApi = (): QueueApi => {
         }
       }
     },
-    release: async (id) => {
+    release: async (id, nextDueAt, error) => {
       const idx = items.findIndex((it) => it.id === id);
       if (idx >= 0) {
         const current = items[idx];
         if (current) {
-          items[idx] = { ...current, locked: false } as MentionQueueTask | AgentInputQueueTask;
+          const attempts = (current.attempts ?? 0) + (error ? 1 : 0);
+          items[idx] = {
+            ...current,
+            attempts,
+            ...(error ? { lastError: error } : {}),
+            ...(attempts >= 3 ? { failedAt: new Date().toISOString() } : {}),
+            ...(error
+              ? {
+                  dueAt: (nextDueAt ?? new Date(Date.now() + 30_000)).toISOString(),
+                }
+              : nextDueAt
+                ? { dueAt: nextDueAt.toISOString() }
+                : {}),
+            locked: false,
+          } as MentionQueueTask | AgentInputQueueTask;
         }
       }
     },

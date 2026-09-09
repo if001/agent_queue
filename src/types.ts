@@ -17,6 +17,10 @@ interface BaseQueueTask {
   intervalMinutes?: number;
   createdAt: string;
   locked: boolean;
+  lockedAt?: string;
+  attempts?: number;
+  lastError?: string;
+  failedAt?: string;
 }
 
 export interface MentionQueueTask extends BaseQueueTask {
@@ -58,7 +62,7 @@ export interface QueueStatus {
 export interface QueueStore {
   dequeueReady(now: Date): Promise<QueueTask | null>;
   ack(taskId: string): Promise<void>;
-  release(taskId: string, nextDueAt?: Date): Promise<void>;
+  release(taskId: string, nextDueAt?: Date, error?: string): Promise<void>;
   getLatestConversationVersion(threadId: string): Promise<number>;
 }
 
