@@ -1,6 +1,13 @@
 import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { AgentInputQueueTask, MentionQueueTask, QueueStatus, QueueTask } from "./types";
+import {
+  AgentInputQueueTask,
+  MentionQueueTask,
+  QueueError,
+  QueueErrorRecord,
+  QueueStatus,
+  QueueTask,
+} from "./types";
 
 type MentionQueueTaskInput = Omit<
   MentionQueueTask,
@@ -16,6 +23,10 @@ interface QueueState {
   conversationVersions: Record<string, number>;
 }
 
+interface QueueErrorState {
+  errors: QueueErrorRecord[];
+}
+
 export class FileQueueStore {
   private mutationQueue: Promise<void> = Promise.resolve();
 
@@ -27,6 +38,7 @@ export class FileQueueStore {
 
   private async enqueueMentionTaskUnlocked(input: MentionQueueTaskInput): Promise<MentionQueueTask> {
     const state = await this.readState();
+    await this.archiveTerminalTasks(state);
     const conversationVersion =
       (state.conversationVersions[input.targetThreadId] ?? 0) + 1;
     state.conversationVersions[input.targetThreadId] = conversationVersion;
@@ -34,13 +46,15 @@ export class FileQueueStore {
       (item): item is MentionQueueTask =>
         item.action === "mention" &&
         item.targetThreadId === input.targetThreadId &&
-        !item.locked,
+        !item.locked &&
+        !item.failedAt,
     );
     const processing = state.tasks.find(
       (item): item is MentionQueueTask =>
         item.action === "mention" &&
         item.targetThreadId === input.targetThreadId &&
-        item.locked,
+        item.locked &&
+        !item.failedAt,
     );
     if (pending) {
       pending.text = mergeUserInput(pending.text, input.text);
@@ -72,6 +86,7 @@ export class FileQueueStore {
 
   private async enqueueTaskUnlocked(input: PersistedQueueTaskInput): Promise<QueueTask> {
     const state = await this.readState();
+    const archived = await this.archiveTerminalTasks(state);
     if (input.sourceInteractionId) {
       const duplicate = state.tasks.find(
         (task) =>
@@ -79,7 +94,12 @@ export class FileQueueStore {
           task.targetThreadId === input.targetThreadId &&
           !task.failedAt,
       );
-      if (duplicate) return duplicate;
+      if (duplicate) {
+        if (archived) {
+          await this.writeState(state);
+        }
+        return duplicate;
+      }
     }
     const task: QueueTask = {
       id: buildTaskId(),
@@ -98,6 +118,7 @@ export class FileQueueStore {
 
   private async dequeueReadyUnlocked(now: Date): Promise<QueueTask | null> {
     const state = await this.readState();
+    const archived = await this.archiveTerminalTasks(state);
     const items = state.tasks;
     const staleLockBefore = now.getTime() - 5 * 60 * 1000;
     for (const item of items) {
@@ -111,6 +132,9 @@ export class FileQueueStore {
       .sort(comparePriority);
     const next = candidates[0];
     if (!next) {
+      if (archived) {
+        await this.writeState(state);
+      }
       return null;
     }
     const idx = items.findIndex((item) => item.id === next.id);
@@ -132,9 +156,13 @@ export class FileQueueStore {
 
   private async ackUnlocked(taskId: string): Promise<void> {
     const state = await this.readState();
+    const archived = await this.archiveTerminalTasks(state);
     const items = state.tasks;
     const index = items.findIndex((item) => item.id === taskId);
     if (index < 0) {
+      if (archived) {
+        await this.writeState(state);
+      }
       return;
     }
     const target = items[index];
@@ -157,15 +185,19 @@ export class FileQueueStore {
     await this.writeState(state);
   }
 
-  release(taskId: string, nextDueAt?: Date, error?: string): Promise<void> {
+  release(taskId: string, nextDueAt?: Date, error?: QueueError): Promise<void> {
     return this.mutate(() => this.releaseUnlocked(taskId, nextDueAt, error));
   }
 
-  private async releaseUnlocked(taskId: string, nextDueAt?: Date, error?: string): Promise<void> {
+  private async releaseUnlocked(taskId: string, nextDueAt?: Date, error?: QueueError): Promise<void> {
     const state = await this.readState();
+    const archived = await this.archiveTerminalTasks(state);
     const items = state.tasks;
     const index = items.findIndex((item) => item.id === taskId);
     if (index < 0) {
+      if (archived) {
+        await this.writeState(state);
+      }
       return;
     }
     const target = items[index];
@@ -173,11 +205,18 @@ export class FileQueueStore {
       return;
     }
     const attempts = (target.attempts ?? 0) + (error ? 1 : 0);
+    if (error && attempts >= 3) {
+      await this.appendErrors([
+        toQueueErrorRecord(target, attempts, new Date().toISOString(), error),
+      ]);
+      items.splice(index, 1);
+      await this.writeState(state);
+      return;
+    }
     items[index] = {
       ...target,
       attempts,
       ...(error ? { lastError: error } : {}),
-      ...(attempts >= 3 ? { failedAt: new Date().toISOString() } : {}),
       dueAt: (nextDueAt ?? new Date(Date.now() + 30_000)).toISOString(),
       locked: false,
       lockedAt: undefined,
@@ -185,9 +224,18 @@ export class FileQueueStore {
     await this.writeState(state);
   }
 
-  async getStatus(now: Date = new Date(), limit: number = 5): Promise<QueueStatus> {
-    await this.mutationQueue;
-    const items = (await this.readState()).tasks;
+  getStatus(now: Date = new Date(), limit: number = 5): Promise<QueueStatus> {
+    return this.mutate(async () => {
+      const state = await this.readState();
+      const archived = await this.archiveTerminalTasks(state);
+      if (archived) {
+        await this.writeState(state);
+      }
+      return this.buildStatus(state.tasks, now, limit);
+    });
+  }
+
+  private buildStatus(items: QueueTask[], now: Date, limit: number): QueueStatus {
     const byType: Record<QueueTask["type"], number> = {
       user: 0,
       scheduled_recurring: 0,
@@ -205,7 +253,11 @@ export class FileQueueStore {
       if (item.locked) {
         locked += 1;
       }
-      if (!item.locked && new Date(item.dueAt).getTime() <= now.getTime()) {
+      if (
+        !item.locked &&
+        !item.failedAt &&
+        new Date(item.dueAt).getTime() <= now.getTime()
+      ) {
         readyByType[item.type] += 1;
       }
     }
@@ -237,10 +289,48 @@ export class FileQueueStore {
     };
   }
 
-  async getLatestConversationVersion(threadId: string): Promise<number> {
-    await this.mutationQueue;
-    const state = await this.readState();
-    return state.conversationVersions[threadId] ?? 0;
+  getLatestConversationVersion(threadId: string): Promise<number> {
+    return this.mutate(async () => {
+      const state = await this.readState();
+      const archived = await this.archiveTerminalTasks(state);
+      if (archived) {
+        await this.writeState(state);
+      }
+      return state.conversationVersions[threadId] ?? 0;
+    });
+  }
+
+  private async archiveTerminalTasks(state: QueueState): Promise<boolean> {
+    const failedTasks = state.tasks.filter((task) => task.failedAt);
+    if (failedTasks.length === 0) {
+      return false;
+    }
+    await this.appendErrors(
+      failedTasks.map((task) =>
+        toQueueErrorRecord(
+          task,
+          task.attempts ?? 0,
+          task.failedAt as string,
+          normalizeStoredError(task.lastError),
+        ),
+      ),
+    );
+    const failedIds = new Set(failedTasks.map((task) => task.id));
+    state.tasks = state.tasks.filter((task) => !failedIds.has(task.id));
+    return true;
+  }
+
+  private async appendErrors(records: QueueErrorRecord[]): Promise<void> {
+    const errorFilePath = buildErrorFilePath(this.filePath);
+    const state = await readErrorState(errorFilePath);
+    const existingIds = new Set(state.errors.map((record) => record.taskId));
+    for (const record of records) {
+      if (!existingIds.has(record.taskId)) {
+        state.errors.push(record);
+        existingIds.add(record.taskId);
+      }
+    }
+    await writeJsonFile(errorFilePath, state);
   }
 
   private async readState(): Promise<QueueState> {
@@ -261,10 +351,7 @@ export class FileQueueStore {
   }
 
   private async writeState(state: QueueState): Promise<void> {
-    await mkdir(dirname(this.filePath), { recursive: true });
-    const temporaryPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(temporaryPath, JSON.stringify(state, null, 2), "utf8");
-    await rename(temporaryPath, this.filePath);
+    await writeJsonFile(this.filePath, state);
   }
 
   private mutate<T>(operation: () => Promise<T>): Promise<T> {
@@ -306,6 +393,54 @@ export class FileQueueStore {
 const emptyQueueState = (): QueueState => ({
   tasks: [],
   conversationVersions: {},
+});
+
+const emptyQueueErrorState = (): QueueErrorState => ({ errors: [] });
+
+const buildErrorFilePath = (queueFilePath: string): string =>
+  queueFilePath.endsWith(".json")
+    ? `${queueFilePath.slice(0, -".json".length)}.errors.json`
+    : `${queueFilePath}.errors.json`;
+
+const readErrorState = async (filePath: string): Promise<QueueErrorState> => {
+  try {
+    const body = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(body) as QueueErrorState;
+    return parsed && Array.isArray(parsed.errors) ? parsed : emptyQueueErrorState();
+  } catch {
+    return emptyQueueErrorState();
+  }
+};
+
+const writeJsonFile = async (filePath: string, value: unknown): Promise<void> => {
+  await mkdir(dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporaryPath, JSON.stringify(value, null, 2), "utf8");
+  await rename(temporaryPath, filePath);
+};
+
+const normalizeStoredError = (error: QueueError | string | undefined): QueueError => {
+  if (typeof error === "object" && error !== null) {
+    return { name: error.name, message: error.message };
+  }
+  return { name: "Error", message: error ?? "handler failed" };
+};
+
+const toQueueErrorRecord = (
+  task: QueueTask,
+  attempts: number,
+  failedAt: string,
+  error: QueueError,
+): QueueErrorRecord => ({
+  taskId: task.id,
+  type: task.type,
+  action: task.action,
+  source: task.source,
+  targetThreadId: task.targetThreadId,
+  createdAt: task.createdAt,
+  failedAt,
+  attempts,
+  error,
 });
 
 const buildTaskId = (): string =>

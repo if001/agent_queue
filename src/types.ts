@@ -2,6 +2,23 @@ export type QueueTaskType = "user" | "scheduled_recurring" | "scheduled_once";
 export type QueueTaskAction = "mention" | "agent_input";
 export type QueueTaskSource = "user" | "simple_pomdp" | "scheduled";
 
+export interface QueueError {
+  name: string;
+  message: string;
+}
+
+export interface QueueErrorRecord {
+  taskId: string;
+  type: QueueTaskType;
+  action: QueueTaskAction;
+  source: QueueTaskSource;
+  targetThreadId: string;
+  createdAt: string;
+  failedAt: string;
+  attempts: number;
+  error: QueueError;
+}
+
 interface BaseQueueTask {
   id: string;
   type: QueueTaskType;
@@ -19,7 +36,7 @@ interface BaseQueueTask {
   locked: boolean;
   lockedAt?: string;
   attempts?: number;
-  lastError?: string;
+  lastError?: QueueError | string;
   failedAt?: string;
 }
 
@@ -62,7 +79,7 @@ export interface QueueStatus {
 export interface QueueStore {
   dequeueReady(now: Date): Promise<QueueTask | null>;
   ack(taskId: string): Promise<void>;
-  release(taskId: string, nextDueAt?: Date, error?: string): Promise<void>;
+  release(taskId: string, nextDueAt?: Date, error?: QueueError): Promise<void>;
   getLatestConversationVersion(threadId: string): Promise<number>;
 }
 

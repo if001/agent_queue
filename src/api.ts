@@ -108,13 +108,15 @@ export const createInMemoryQueueApi = (): QueueApi => {
         (item): item is MentionQueueTask =>
           item.action === "mention" &&
           item.targetThreadId === input.targetThreadId &&
-          !item.locked,
+          !item.locked &&
+          !item.failedAt,
       );
       const processing = items.find(
         (item): item is MentionQueueTask =>
           item.action === "mention" &&
           item.targetThreadId === input.targetThreadId &&
-          item.locked,
+          item.locked &&
+          !item.failedAt,
       );
       if (pending) {
         pending.text = mergeUserInput(pending.text, input.text);
@@ -192,11 +194,14 @@ export const createInMemoryQueueApi = (): QueueApi => {
         const current = items[idx];
         if (current) {
           const attempts = (current.attempts ?? 0) + (error ? 1 : 0);
+          if (error && attempts >= 3) {
+            items.splice(idx, 1);
+            return;
+          }
           items[idx] = {
             ...current,
             attempts,
             ...(error ? { lastError: error } : {}),
-            ...(attempts >= 3 ? { failedAt: new Date().toISOString() } : {}),
             ...(error
               ? {
                   dueAt: (nextDueAt ?? new Date(Date.now() + 30_000)).toISOString(),
@@ -226,7 +231,11 @@ export const createInMemoryQueueApi = (): QueueApi => {
         if (item.locked) {
           locked += 1;
         }
-        if (!item.locked && new Date(item.dueAt).getTime() <= now.getTime()) {
+        if (
+          !item.locked &&
+          !item.failedAt &&
+          new Date(item.dueAt).getTime() <= now.getTime()
+        ) {
           readyByType[item.type] += 1;
         }
       }
@@ -239,7 +248,7 @@ export const createInMemoryQueueApi = (): QueueApi => {
           readyByType,
         },
         next: items
-          .filter((item) => !item.locked)
+          .filter((item) => !item.locked && !item.failedAt)
           .slice(0, Math.max(0, limit))
           .map((item) => ({
             id: item.id,

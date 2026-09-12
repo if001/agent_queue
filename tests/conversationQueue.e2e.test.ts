@@ -34,4 +34,39 @@ describe("conversation queue fixture", () => {
     expect(third.text).toContain("third");
     expect(await queue.getLatestConversationVersion(third.targetThreadId)).toBe(3);
   });
+
+  test("removes a task from the active queue after its final failure", async () => {
+    const queue = createInMemoryQueueApi();
+    const now = new Date("2026-09-01T00:00:00.000Z");
+    await queue.enqueueMention({
+      botId: "ao",
+      userId: "user-1",
+      channelId: "channel-1",
+      text: "failed input",
+      mentionsBot: true,
+      dueAt: now,
+    });
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const task = await queue.dequeueReady(now);
+      expect(task).not.toBeNull();
+      await queue.release(task!.id, now, {
+        name: "TestError",
+        message: `failure-${attempt + 1}`,
+      });
+    }
+
+    expect((await queue.getStatus(now)).counts.total).toBe(0);
+    expect(await queue.dequeueReady(now)).toBeNull();
+
+    const fresh = await queue.enqueueMention({
+      botId: "ao",
+      userId: "user-1",
+      channelId: "channel-1",
+      text: "fresh input",
+      mentionsBot: true,
+      dueAt: now,
+    });
+    expect(fresh.text).toBe("fresh input");
+  });
 });
